@@ -6,7 +6,7 @@ Holt aktuelle News zu XRP, Ripple und Trump Crypto
 und uebersetzt sie automatisch ins Deutsche.
 
 Installation:
-    pip install "python-telegram-bot[job-queue]" feedparser deep-translator aiohttp
+    pip install "python-telegram-bot[job-queue]" feedparser deep-translator
 
 Starten:
     python xrp_news_bot.py
@@ -20,10 +20,11 @@ Befehle:
 """
 
 import asyncio
+import json
 import logging
 import socket
 import os
-from datetime import datetime
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -36,8 +37,14 @@ BOT_TOKEN   = os.environ.get("NEWS_BOT_TOKEN", "")
 NEWS_COUNT  = int(os.environ.get("NEWS_COUNT", "5"))
 BERLIN      = ZoneInfo("Europe/Berlin")
 
-DATA_DIR    = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
-LOG_FILE    = os.path.join(DATA_DIR, "news_bot.log")
+DATA_DIR      = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
+LOG_FILE      = os.path.join(DATA_DIR, "news_bot.log")
+SEEN_XRP_FILE = os.path.join(DATA_DIR, "seen_xrp.json")
+SEEN_TRUMP_FILE = os.path.join(DATA_DIR, "seen_trump.json")
+
+# Automatische News: Uhrzeit in Berliner Zeit
+AUTO_HOUR_1   = int(os.environ.get("AUTO_HOUR_1", "13"))  # 13:00 Uhr
+AUTO_HOUR_2   = int(os.environ.get("AUTO_HOUR_2", "23"))  # 23:00 Uhr
 
 # ── News-Quellen ───────────────────────────────────────────────────────────────
 XRP_FEEDS = [
@@ -76,6 +83,30 @@ TRUMP_KEYWORDS = [
     "crypto regulation", "sec crypto", "coinbase sec",
 ]
 
+# ── Gesehene Artikel (verhindert Duplikate) ───────────────────────────────────
+def load_seen(path: str) -> set:
+    """Laedt bereits gesehene Artikel-Links aus Datei."""
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+def save_seen(path: str, seen: set, max_size: int = 500) -> None:
+    """Speichert gesehene Links atomar. Behaelt nur die neuesten max_size Eintraege."""
+    # sorted() fuer deterministische Reihenfolge; neueste bleiben erhalten
+    lst = sorted(seen)[-max_size:]
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(lst, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.error(f"Fehler beim Speichern seen: {e}")
+
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 _handlers = [logging.StreamHandler()]
 try:
@@ -92,10 +123,16 @@ log = logging.getLogger(__name__)
 
 
 # ── News abrufen ───────────────────────────────────────────────────────────────
-def fetch_news(feeds: list, keywords: list, count: int = 10) -> list:
-    """Holt News aus RSS-Feeds und filtert nach Keywords."""
-    entries = []
-    seen    = set()
+def fetch_news(feeds: list, keywords: list, count: int = 10,
+               seen_file: str = None, mark_seen: bool = False) -> list:
+    """
+    Holt News aus RSS-Feeds und filtert nach Keywords.
+    seen_file: Pfad zur Datei mit bereits gesehenen Links (verhindert Duplikate).
+    mark_seen: Wenn True, werden neue Links als gesehen markiert und gespeichert.
+    """
+    entries  = []
+    seen     = set()
+    seen_old = load_seen(seen_file) if seen_file else set()
 
     for feed_url in feeds:
         try:
@@ -110,7 +147,7 @@ def fetch_news(feeds: list, keywords: list, count: int = 10) -> list:
                 link    = entry.get("link", "")
                 summary = entry.get("summary", entry.get("description", ""))
 
-                if link in seen or not title:
+                if link in seen or link in seen_old or not title:
                     continue
 
                 combined = (title + " " + summary).lower()
@@ -136,7 +173,12 @@ def fetch_news(feeds: list, keywords: list, count: int = 10) -> list:
         key=lambda e: e.get("published_parsed") or (0,0,0,0,0,0,0,0,0),
         reverse=True
     )
-    return entries[:count]
+    result = entries[:count]
+    # Neue Links als gesehen speichern
+    if seen_file and mark_seen and result:
+        new_seen = seen_old | {e["link"] for e in result}
+        save_seen(seen_file, new_seen)
+    return result
 
 
 def translate_batch(texts: list) -> list:
@@ -195,6 +237,22 @@ def format_news_msg(entries: list, titel: str) -> str:
 
 # ── Telegram Befehle ───────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # User-ID speichern fuer automatische News
+    chat_id    = str(update.effective_chat.id)
+    users_file = os.path.join(DATA_DIR, "users.json")
+    try:
+        if os.path.exists(users_file):
+            with open(users_file) as f:
+                users = json.load(f)
+        else:
+            users = []
+        if chat_id not in users:
+            users.append(chat_id)
+            with open(users_file, "w") as f:
+                json.dump(users, f)
+    except Exception as e:
+        log.error(f"User speichern Fehler: {e}")
+
     await update.message.reply_text(
         "📰 *XRP & Trump Crypto News Bot*\n\n"
         "Aktuelle Nachrichten zu XRP, Ripple und Trump Crypto-Politik "
@@ -217,11 +275,17 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Beide Kategorien parallel abrufen
         xrp_entries, trump_entries = await asyncio.gather(
             asyncio.wait_for(
-                loop.run_in_executor(None, lambda: fetch_news(XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT)),
+                loop.run_in_executor(None, lambda: fetch_news(
+                    XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
+                    seen_file=SEEN_XRP_FILE, mark_seen=True
+                )),
                 timeout=30.0
             ),
             asyncio.wait_for(
-                loop.run_in_executor(None, lambda: fetch_news(TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT)),
+                loop.run_in_executor(None, lambda: fetch_news(
+                    TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT,
+                    seen_file=SEEN_TRUMP_FILE, mark_seen=True
+                )),
                 timeout=30.0
             ),
         )
@@ -256,7 +320,10 @@ async def cmd_xrp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         loop    = asyncio.get_running_loop()
         entries = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: fetch_news(XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT)),
+            loop.run_in_executor(None, lambda: fetch_news(
+                XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
+                seen_file=SEEN_XRP_FILE, mark_seen=True
+            )),
             timeout=30.0
         )
         msg = await asyncio.wait_for(
@@ -279,7 +346,10 @@ async def cmd_trump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         loop    = asyncio.get_running_loop()
         entries = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: fetch_news(TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT)),
+            loop.run_in_executor(None, lambda: fetch_news(
+                TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT,
+                seen_file=SEEN_TRUMP_FILE, mark_seen=True
+            )),
             timeout=30.0
         )
         msg = await asyncio.wait_for(
@@ -314,6 +384,76 @@ async def cmd_hilfe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# ── Automatische News-Jobs ────────────────────────────────────────────────────
+async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sendet automatisch News 2x taeglich an alle bekannten User."""
+    # Alle User die jemals den Bot gestartet haben
+    users_file = os.path.join(DATA_DIR, "users.json")
+    if not os.path.exists(users_file):
+        log.info("auto_news_job: Keine User-Datei gefunden")
+        return
+    try:
+        with open(users_file) as f:
+            users = json.load(f)
+    except Exception as e:
+        log.error(f"auto_news_job: Fehler beim Laden der User: {e}")
+        return
+
+    loop = asyncio.get_running_loop()
+    try:
+        xrp_entries, trump_entries = await asyncio.gather(
+            asyncio.wait_for(
+                loop.run_in_executor(None, lambda: fetch_news(
+                    XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
+                    seen_file=SEEN_XRP_FILE, mark_seen=True
+                )),
+                timeout=30.0
+            ),
+            asyncio.wait_for(
+                loop.run_in_executor(None, lambda: fetch_news(
+                    TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT,
+                    seen_file=SEEN_TRUMP_FILE, mark_seen=True
+                )),
+                timeout=30.0
+            ),
+        )
+        xrp_msg, trump_msg = await asyncio.gather(
+            asyncio.wait_for(
+                loop.run_in_executor(None, lambda: format_news_msg(xrp_entries, "XRP & Ripple News")),
+                timeout=30.0
+            ),
+            asyncio.wait_for(
+                loop.run_in_executor(None, lambda: format_news_msg(trump_entries, "Trump & Crypto Politik")),
+                timeout=30.0
+            ),
+        )
+    except asyncio.TimeoutError:
+        log.error("auto_news_job: Zeitueberschreitung")
+        return
+    except Exception as e:
+        log.error(f"auto_news_job: Fehler: {e}")
+        return
+
+    if not xrp_entries and not trump_entries:
+        log.info("auto_news_job: Keine neuen Artikel")
+        return
+
+    for chat_id in users:
+        for msg in [xrp_msg, trump_msg]:
+            if "Keine aktuellen" in msg:
+                continue
+            if len(msg) > 4096:
+                msg = msg[:4090] + "..."
+            try:
+                await context.bot.send_message(
+                    chat_id=int(chat_id),
+                    text=msg,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                log.error(f"auto_news_job: Sendefehler {chat_id}: {e}")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     if not BOT_TOKEN:
@@ -327,6 +467,18 @@ def main() -> None:
     app.add_handler(CommandHandler("xrp",   cmd_xrp))
     app.add_handler(CommandHandler("trump", cmd_trump))
     app.add_handler(CommandHandler("hilfe", cmd_hilfe))
+
+    # Automatische News 2x taeglich (BERLIN und dtime als Top-Level)
+    app.job_queue.run_daily(
+        auto_news_job,
+        time=dtime(hour=AUTO_HOUR_1, minute=0, tzinfo=BERLIN),
+        name="auto_news_13"
+    )
+    app.job_queue.run_daily(
+        auto_news_job,
+        time=dtime(hour=AUTO_HOUR_2, minute=0, tzinfo=BERLIN),
+        name="auto_news_23"
+    )
 
     log.info("XRP News Bot gestartet ✅")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
