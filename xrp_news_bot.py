@@ -22,7 +22,9 @@ Befehle:
 import asyncio
 import logging
 import socket
+import json
 import os
+import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -33,7 +35,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ── Konfiguration ──────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.environ.get("NEWS_BOT_TOKEN", "")
-NEWS_COUNT  = int(os.environ.get("NEWS_COUNT", "5"))
+NEWS_COUNT  = int(os.environ.get("NEWS_COUNT", "10"))
 BERLIN      = ZoneInfo("Europe/Berlin")
 
 DATA_DIR    = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
@@ -41,34 +43,20 @@ LOG_FILE    = os.path.join(DATA_DIR, "news_bot.log")
 
 # ── News-Quellen ───────────────────────────────────────────────────────────────
 XRP_FEEDS = [
-    # Crypto-Quellen
     "https://cointelegraph.com/rss/tag/ripple",
     "https://cryptonews.com/news/ripple-news/feed/",
     "https://www.newsbtc.com/feed/",
     "https://coinjournal.net/feed/",
     "https://ambcrypto.com/feed/",
-    # Grosse US-Medien
-    "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
-    "https://feeds.washingtonpost.com/rss/business/technology",
-    "https://feeds.washingtonpost.com/rss/business",
 ]
 XRP_KEYWORDS = ["xrp", "ripple", "sec ripple", "xrp etf", "xrp ledger", "brad garlinghouse"]
 
 TRUMP_FEEDS = [
-    # Crypto-Quellen
     "https://cointelegraph.com/rss/tag/regulation",
     "https://cointelegraph.com/rss/tag/government",
     "https://decrypt.co/feed",
     "https://coindesk.com/arc/outboundfeeds/rss/",
     "https://www.newsbtc.com/feed/",
-    # Grosse US-Medien (Politik + Wirtschaft)
-    "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
-    "https://feeds.washingtonpost.com/rss/politics",
-    "https://feeds.washingtonpost.com/rss/business",
-    "https://feeds.washingtonpost.com/rss/business/technology",
 ]
 TRUMP_KEYWORDS = [
     "trump", "crypto reserve", "bitcoin reserve", "digital asset",
@@ -119,10 +107,9 @@ def fetch_news(feeds: list, keywords: list, count: int = 10) -> list:
 
                 seen.add(link)
                 entries.append({
-                    "title":           title,
-                    "link":            link,
-                    "source":          feed.feed.get("title", feed_url),
-                    "published_parsed": entry.get("published_parsed"),
+                    "title":   title,
+                    "link":    link,
+                    "source":  feed.feed.get("title", feed_url),
                 })
 
                 if len(entries) >= count * 2:
@@ -131,11 +118,6 @@ def fetch_news(feeds: list, keywords: list, count: int = 10) -> list:
         except Exception as e:
             log.error(f"Feed-Fehler {feed_url}: {e}")
 
-    # Neueste zuerst sortieren
-    entries.sort(
-        key=lambda e: e.get("published_parsed") or (0,0,0,0,0,0,0,0,0),
-        reverse=True
-    )
     return entries[:count]
 
 
@@ -145,12 +127,7 @@ def translate_batch(texts: list) -> list:
         return texts
     try:
         results = GoogleTranslator(source="auto", target="de").translate_batch(texts)
-        # zip-safe: falls Google weniger Ergebnisse liefert, Original-Text als Fallback
-        translated = [r if r else t for r, t in zip(results, texts)]
-        # Fehlende Eintraege mit Originaltexten auffuellen
-        if len(translated) < len(texts):
-            translated += texts[len(translated):]
-        return translated
+        return [r if r else t for r, t in zip(results, texts)]
     except Exception as e:
         log.warning(f"Uebersetzungsfehler: {e}")
         return texts
@@ -173,21 +150,7 @@ def format_news_msg(entries: list, titel: str) -> str:
 
     lines = [f"📰 {titel}\n{datetime.now(BERLIN).strftime('%d.%m.%Y %H:%M')} Uhr\n"]
     for i, (e, title_de) in enumerate(zip(entries, titles_de), 1):
-        # Quelle kennzeichnen
-        src_name = e["source"]
-        if "nytimes" in e["link"] or "New York Times" in src_name:
-            label = "NYT"
-        elif "washingtonpost" in e["link"] or "Washington Post" in src_name:
-            label = "WaPo"
-        elif "cointelegraph" in e["link"]:
-            label = "CT"
-        elif "decrypt" in e["link"]:
-            label = "Decrypt"
-        elif "coindesk" in e["link"]:
-            label = "CoinDesk"
-        else:
-            label = "News"
-        lines.append(f"{i}. [{label}] {escape_md(title_de)}")
+        lines.append(f"{i}. {escape_md(title_de)}")
         lines.append(f"   {e['link']}\n")
 
     return "\n".join(lines)
@@ -217,11 +180,11 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Beide Kategorien parallel abrufen
         xrp_entries, trump_entries = await asyncio.gather(
             asyncio.wait_for(
-                loop.run_in_executor(None, lambda: fetch_news(XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT)),
+                loop.run_in_executor(None, lambda: fetch_news(XRP_FEEDS, XRP_KEYWORDS, 5)),
                 timeout=30.0
             ),
             asyncio.wait_for(
-                loop.run_in_executor(None, lambda: fetch_news(TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT)),
+                loop.run_in_executor(None, lambda: fetch_news(TRUMP_FEEDS, TRUMP_KEYWORDS, 5)),
                 timeout=30.0
             ),
         )
@@ -303,13 +266,13 @@ async def cmd_hilfe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "        XRP + Ripple + Trump Crypto\n\n"
         "/xrp   - Nur XRP & Ripple News\n"
         "        Quellen: CoinTelegraph, CryptoNews,\n"
-        "        NewsBTC, NY Times, Washington Post\n\n"
+        "        NewsBTC, CoinJournal, AMBCrypto\n\n"
         "/trump - Nur Trump & Crypto Politik\n"
         "        Quellen: CoinTelegraph, Decrypt,\n"
-        "        CoinDesk, NY Times, Washington Post\n\n"
+        "        CoinDesk, NewsBTC\n\n"
         "/start - Willkommen\n\n"
         "🌍 Alle News automatisch auf Deutsch\n"
-        "📍 Zeitzone: Europa/Berlin",
+        f"📍 Zeitzone: Europa/Berlin",
         parse_mode="Markdown",
     )
 
