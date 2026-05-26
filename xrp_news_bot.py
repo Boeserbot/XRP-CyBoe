@@ -39,12 +39,17 @@ BERLIN      = ZoneInfo("Europe/Berlin")
 
 DATA_DIR      = "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__))
 LOG_FILE      = os.path.join(DATA_DIR, "news_bot.log")
-SEEN_XRP_FILE = os.path.join(DATA_DIR, "seen_xrp.json")
-SEEN_TRUMP_FILE = os.path.join(DATA_DIR, "seen_trump.json")
+# Seen-Dateien werden pro User gespeichert: seen_xrp_<chat_id>.json
+def seen_xrp_file(chat_id: str) -> str:
+    return os.path.join(DATA_DIR, f"seen_xrp_{chat_id}.json")
+
+def seen_trump_file(chat_id: str) -> str:
+    return os.path.join(DATA_DIR, f"seen_trump_{chat_id}.json")
 
 # Automatische News: Uhrzeit in Berliner Zeit
-AUTO_HOUR_1   = int(os.environ.get("AUTO_HOUR_1", "13"))  # 13:00 Uhr
-AUTO_HOUR_2   = int(os.environ.get("AUTO_HOUR_2", "23"))  # 23:00 Uhr
+AUTO_HOUR_1   = int(os.environ.get("AUTO_HOUR_1", "7"))   # 07:00 Uhr
+AUTO_HOUR_2   = int(os.environ.get("AUTO_HOUR_2", "13"))  # 13:00 Uhr
+AUTO_HOUR_3   = int(os.environ.get("AUTO_HOUR_3", "23"))  # 23:00 Uhr
 
 # ── News-Quellen ───────────────────────────────────────────────────────────────
 XRP_FEEDS = [
@@ -83,6 +88,21 @@ TRUMP_KEYWORDS = [
     "crypto regulation", "sec crypto", "coinbase sec",
 ]
 
+# ── Logging (muss vor allen Funktionen stehen die log nutzen) ─────────────────
+_handlers = [logging.StreamHandler()]
+try:
+    _handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
+except OSError as e:
+    print(f"Log-Datei Fehler: {e}")
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+    handlers=_handlers,
+)
+log = logging.getLogger(__name__)
+
+
 # ── Gesehene Artikel (verhindert Duplikate) ───────────────────────────────────
 def load_seen(path: str) -> set:
     """Laedt bereits gesehene Artikel-Links aus Datei."""
@@ -96,7 +116,6 @@ def load_seen(path: str) -> set:
 
 def save_seen(path: str, seen: set, max_size: int = 500) -> None:
     """Speichert gesehene Links atomar. Behaelt nur die neuesten max_size Eintraege."""
-    # sorted() fuer deterministische Reihenfolge; neueste bleiben erhalten
     lst = sorted(seen)[-max_size:]
     try:
         tmp = path + ".tmp"
@@ -105,21 +124,6 @@ def save_seen(path: str, seen: set, max_size: int = 500) -> None:
         os.replace(tmp, path)
     except Exception as e:
         log.error(f"Fehler beim Speichern seen: {e}")
-
-
-# ── Logging ────────────────────────────────────────────────────────────────────
-_handlers = [logging.StreamHandler()]
-try:
-    _handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
-except OSError as e:
-    print(f"Log-Datei Fehler: {e}")
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-    handlers=_handlers,
-)
-log = logging.getLogger(__name__)
 
 
 # ── News abrufen ───────────────────────────────────────────────────────────────
@@ -167,6 +171,10 @@ def fetch_news(feeds: list, keywords: list, count: int = 10,
 
         except Exception as e:
             log.error(f"Feed-Fehler {feed_url}: {e}")
+
+        # Genug Artikel gesammelt – restliche Feeds ueberspringen
+        if len(entries) >= count * 2:
+            break
 
     # Neueste zuerst sortieren
     entries.sort(
@@ -248,8 +256,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             users = []
         if chat_id not in users:
             users.append(chat_id)
-            with open(users_file, "w") as f:
+            tmp = users_file + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(users, f)
+            os.replace(tmp, users_file)
     except Exception as e:
         log.error(f"User speichern Fehler: {e}")
 
@@ -273,18 +283,19 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         loop = asyncio.get_running_loop()
 
         # Beide Kategorien parallel abrufen
+        cid = str(update.effective_chat.id)
         xrp_entries, trump_entries = await asyncio.gather(
             asyncio.wait_for(
                 loop.run_in_executor(None, lambda: fetch_news(
                     XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
-                    seen_file=SEEN_XRP_FILE, mark_seen=True
+                    seen_file=seen_xrp_file(cid), mark_seen=True
                 )),
                 timeout=30.0
             ),
             asyncio.wait_for(
                 loop.run_in_executor(None, lambda: fetch_news(
                     TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT,
-                    seen_file=SEEN_TRUMP_FILE, mark_seen=True
+                    seen_file=seen_trump_file(cid), mark_seen=True
                 )),
                 timeout=30.0
             ),
@@ -319,10 +330,11 @@ async def cmd_xrp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("⏳ Hole XRP & Ripple News...")
     try:
         loop    = asyncio.get_running_loop()
+        cid     = str(update.effective_chat.id)
         entries = await asyncio.wait_for(
             loop.run_in_executor(None, lambda: fetch_news(
                 XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
-                seen_file=SEEN_XRP_FILE, mark_seen=True
+                seen_file=seen_xrp_file(cid), mark_seen=True
             )),
             timeout=30.0
         )
@@ -345,10 +357,11 @@ async def cmd_trump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("⏳ Hole Trump & Crypto Politik News...")
     try:
         loop    = asyncio.get_running_loop()
+        cid     = str(update.effective_chat.id)
         entries = await asyncio.wait_for(
             loop.run_in_executor(None, lambda: fetch_news(
                 TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT,
-                seen_file=SEEN_TRUMP_FILE, mark_seen=True
+                seen_file=seen_trump_file(cid), mark_seen=True
             )),
             timeout=30.0
         )
@@ -379,6 +392,7 @@ async def cmd_hilfe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "        CoinDesk, NY Times, Washington Post\n\n"
         "/start - Willkommen\n\n"
         "🌍 Alle News automatisch auf Deutsch\n"
+        "⏰ Automatisch um 07:00, 13:00 und 23:00 Uhr\n"
         "📍 Zeitzone: Europa/Berlin",
         parse_mode="Markdown",
     )
@@ -386,11 +400,14 @@ async def cmd_hilfe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Automatische News-Jobs ────────────────────────────────────────────────────
 async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sendet automatisch News 2x taeglich an alle bekannten User."""
-    # Alle User die jemals den Bot gestartet haben
+    """
+    Sendet automatisch News 3x taeglich an alle User.
+    FIX: Kein 'update' in Job-Callbacks – nur 'context' verfuegbar.
+    FIX: Pro User eigene seen-Datei -> jeder sieht nur seine neuen Artikel.
+    """
     users_file = os.path.join(DATA_DIR, "users.json")
     if not os.path.exists(users_file):
-        log.info("auto_news_job: Keine User-Datei gefunden")
+        log.info("auto_news_job: Keine User-Datei – niemand hat /start getippt")
         return
     try:
         with open(users_file) as f:
@@ -399,46 +416,60 @@ async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error(f"auto_news_job: Fehler beim Laden der User: {e}")
         return
 
+    if not users:
+        return
+
     loop = asyncio.get_running_loop()
-    try:
-        xrp_entries, trump_entries = await asyncio.gather(
-            asyncio.wait_for(
-                loop.run_in_executor(None, lambda: fetch_news(
-                    XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
-                    seen_file=SEEN_XRP_FILE, mark_seen=True
-                )),
-                timeout=30.0
-            ),
-            asyncio.wait_for(
-                loop.run_in_executor(None, lambda: fetch_news(
-                    TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT,
-                    seen_file=SEEN_TRUMP_FILE, mark_seen=True
-                )),
-                timeout=30.0
-            ),
-        )
-        xrp_msg, trump_msg = await asyncio.gather(
-            asyncio.wait_for(
-                loop.run_in_executor(None, lambda: format_news_msg(xrp_entries, "XRP & Ripple News")),
-                timeout=30.0
-            ),
-            asyncio.wait_for(
-                loop.run_in_executor(None, lambda: format_news_msg(trump_entries, "Trump & Crypto Politik")),
-                timeout=30.0
-            ),
-        )
-    except asyncio.TimeoutError:
-        log.error("auto_news_job: Zeitueberschreitung")
-        return
-    except Exception as e:
-        log.error(f"auto_news_job: Fehler: {e}")
-        return
 
-    if not xrp_entries and not trump_entries:
-        log.info("auto_news_job: Keine neuen Artikel")
-        return
-
+    # Pro User separat – jeder hat eigene seen-Datei
     for chat_id in users:
+        cid = str(chat_id)
+        try:
+            xrp_entries, trump_entries = await asyncio.gather(
+                asyncio.wait_for(
+                    loop.run_in_executor(None, lambda c=cid: fetch_news(
+                        XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
+                        seen_file=seen_xrp_file(c), mark_seen=True
+                    )),
+                    timeout=30.0
+                ),
+                asyncio.wait_for(
+                    loop.run_in_executor(None, lambda c=cid: fetch_news(
+                        TRUMP_FEEDS, TRUMP_KEYWORDS, NEWS_COUNT,
+                        seen_file=seen_trump_file(c), mark_seen=True
+                    )),
+                    timeout=30.0
+                ),
+            )
+        except asyncio.TimeoutError:
+            log.error(f"auto_news_job: Timeout fuer {cid}")
+            continue
+        except Exception as e:
+            log.error(f"auto_news_job: Fetch-Fehler fuer {cid}: {e}")
+            continue
+
+        if not xrp_entries and not trump_entries:
+            log.info(f"auto_news_job: Keine neuen Artikel fuer {cid}")
+            continue
+
+        try:
+            xrp_msg, trump_msg = await asyncio.gather(
+                asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: format_news_msg(xrp_entries, "XRP & Ripple News")),
+                    timeout=30.0
+                ),
+                asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: format_news_msg(trump_entries, "Trump & Crypto Politik")),
+                    timeout=30.0
+                ),
+            )
+        except asyncio.TimeoutError:
+            log.error(f"auto_news_job: Format-Timeout fuer {cid}")
+            continue
+        except Exception as e:
+            log.error(f"auto_news_job: Format-Fehler fuer {cid}: {e}")
+            continue
+
         for msg in [xrp_msg, trump_msg]:
             if "Keine aktuellen" in msg:
                 continue
@@ -450,8 +481,9 @@ async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     text=msg,
                     disable_web_page_preview=True,
                 )
+                log.info(f"auto_news_job: Gesendet an {cid}")
             except Exception as e:
-                log.error(f"auto_news_job: Sendefehler {chat_id}: {e}")
+                log.error(f"auto_news_job: Sendefehler {cid}: {e}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -468,15 +500,20 @@ def main() -> None:
     app.add_handler(CommandHandler("trump", cmd_trump))
     app.add_handler(CommandHandler("hilfe", cmd_hilfe))
 
-    # Automatische News 2x taeglich (BERLIN und dtime als Top-Level)
+    # Automatische News 3x taeglich (BERLIN und dtime als Top-Level)
     app.job_queue.run_daily(
         auto_news_job,
         time=dtime(hour=AUTO_HOUR_1, minute=0, tzinfo=BERLIN),
-        name="auto_news_13"
+        name="auto_news_07"
     )
     app.job_queue.run_daily(
         auto_news_job,
         time=dtime(hour=AUTO_HOUR_2, minute=0, tzinfo=BERLIN),
+        name="auto_news_13"
+    )
+    app.job_queue.run_daily(
+        auto_news_job,
+        time=dtime(hour=AUTO_HOUR_3, minute=0, tzinfo=BERLIN),
         name="auto_news_23"
     )
 
