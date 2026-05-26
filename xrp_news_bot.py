@@ -48,6 +48,7 @@ def seen_trump_file(chat_id: str) -> str:
 
 # Automatische News: Uhrzeit in Berliner Zeit
 AUTO_HOUR_1   = int(os.environ.get("AUTO_HOUR_1", "7"))   # 07:00 Uhr
+CACHE_TTL_MIN = int(os.environ.get("CACHE_TTL_MIN", "30")) # Cache-Lebenszeit in Minuten
 AUTO_HOUR_2   = int(os.environ.get("AUTO_HOUR_2", "13"))  # 13:00 Uhr
 AUTO_HOUR_3   = int(os.environ.get("AUTO_HOUR_3", "23"))  # 23:00 Uhr
 
@@ -126,17 +127,43 @@ def save_seen(path: str, seen: set, max_size: int = 500) -> None:
         log.error(f"Fehler beim Speichern seen: {e}")
 
 
+# ── News-Cache (verhindert zu viele RSS/Translate Anfragen bei vielen Usern) ──
+import time as _time
+
+class NewsCache:
+    """Einfacher In-Memory Cache mit TTL fuer RSS-Artikel + Uebersetzungen."""
+    def __init__(self, ttl_minutes: int = 30):
+        self._ttl     = ttl_minutes * 60
+        self._store   = {}  # key -> (value, timestamp)
+
+    def get(self, key: str):
+        if key in self._store:
+            value, ts = self._store[key]
+            if _time.monotonic() - ts < self._ttl:
+                return value
+            del self._store[key]
+        return None
+
+    def set(self, key: str, value) -> None:
+        self._store[key] = (value, _time.monotonic())
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+_cache = NewsCache(ttl_minutes=CACHE_TTL_MIN)
+
+
 # ── News abrufen ───────────────────────────────────────────────────────────────
-def fetch_news(feeds: list, keywords: list, count: int = 10,
-               seen_file: str = None, mark_seen: bool = False) -> list:
+def _fetch_news_raw(feeds: list, keywords: list, count: int = 10) -> list:
+    """Interner RSS-Fetch ohne Cache und ohne Seen-Filter."""
     """
     Holt News aus RSS-Feeds und filtert nach Keywords.
     seen_file: Pfad zur Datei mit bereits gesehenen Links (verhindert Duplikate).
     mark_seen: Wenn True, werden neue Links als gesehen markiert und gespeichert.
     """
-    entries  = []
-    seen     = set()
-    seen_old = load_seen(seen_file) if seen_file else set()
+    entries = []
+    seen    = set()
 
     for feed_url in feeds:
         try:
@@ -181,29 +208,69 @@ def fetch_news(feeds: list, keywords: list, count: int = 10,
         key=lambda e: e.get("published_parsed") or (0,0,0,0,0,0,0,0,0),
         reverse=True
     )
-    result = entries[:count]
-    # Neue Links als gesehen speichern
+    # Neueste zuerst sortieren
+    entries.sort(
+        key=lambda e: e.get("published_parsed") or (0,0,0,0,0,0,0,0,0),
+        reverse=True
+    )
+    return entries[:count]
+
+
+def fetch_news(feeds: list, keywords: list, count: int = 10,
+               seen_file: str = None, mark_seen: bool = False) -> list:
+    """
+    Cache-gestützter Fetch: RSS wird max. alle CACHE_TTL_MIN Minuten abgerufen.
+    Viele User teilen denselben Cache – drastisch weniger RSS-Anfragen.
+    Seen-Filter bleibt pro User individuell.
+    """
+    cache_key   = f"news_{id(feeds)}_{count}"
+    all_entries = _cache.get(cache_key)
+    if all_entries is None:
+        all_entries = _fetch_news_raw(feeds, keywords, count * 3)
+        _cache.set(cache_key, all_entries)
+        log.info(f"Cache MISS: {len(all_entries)} Artikel geladen")
+    else:
+        log.info(f"Cache HIT: {len(all_entries)} Artikel aus Cache")
+
+    seen_old = load_seen(seen_file) if seen_file else set()
+    result   = [e for e in all_entries if e["link"] not in seen_old][:count]
+
     if seen_file and mark_seen and result:
-        new_seen = seen_old | {e["link"] for e in result}
-        save_seen(seen_file, new_seen)
+        save_seen(seen_file, seen_old | {e["link"] for e in result})
+
     return result
 
 
 def translate_batch(texts: list) -> list:
-    """Uebersetzt Liste von Texten ins Deutsche (ein Request)."""
+    """
+    Uebersetzt Texte ins Deutsche mit Cache.
+    Gleiche Titel werden nie zweimal uebersetzt – spart Google-Anfragen.
+    """
     if not texts:
         return texts
-    try:
-        results = GoogleTranslator(source="auto", target="de").translate_batch(texts)
-        # zip-safe: falls Google weniger Ergebnisse liefert, Original-Text als Fallback
-        translated = [r if r else t for r, t in zip(results, texts)]
-        # Fehlende Eintraege mit Originaltexten auffuellen
-        if len(translated) < len(texts):
-            translated += texts[len(translated):]
-        return translated
-    except Exception as e:
-        log.warning(f"Uebersetzungsfehler: {e}")
-        return texts
+    results      = [None] * len(texts)
+    to_translate = []
+    indices      = []
+    for i, t in enumerate(texts):
+        cached = _cache.get(f"tr_{t[:60]}")
+        if cached:
+            results[i] = cached
+        else:
+            to_translate.append(t)
+            indices.append(i)
+    if to_translate:
+        try:
+            translated = GoogleTranslator(source="auto", target="de").translate_batch(to_translate)
+            if len(translated) < len(to_translate):
+                translated += to_translate[len(translated):]
+            for idx, tr in zip(indices, translated):
+                results[idx] = tr if tr else texts[idx]
+                _cache.set(f"tr_{texts[idx][:60]}", results[idx])
+        except Exception as e:
+            log.warning(f"Uebersetzungsfehler: {e}")
+            for idx in indices:
+                results[idx] = texts[idx]
+    return results
 
 
 def escape_md(text: str) -> str:
