@@ -15,8 +15,10 @@ Befehle:
     /start   - Willkommen
     /news    - Alle News (XRP + Ripple + Trump Crypto)
     /xrp     - Nur XRP & Ripple News
-    /trump   - Nur Trump & Crypto Politik News
-    /hilfe   - Befehlsuebersicht
+    /trump     - Nur Trump & Crypto Politik News
+    /asiabrics - Asien & BRICS Crypto News
+    /resetnews - News-Verlauf zuruecksetzen
+    /hilfe     - Befehlsuebersicht
 """
 
 import asyncio
@@ -46,6 +48,9 @@ def seen_xrp_file(chat_id: str) -> str:
 
 def seen_trump_file(chat_id: str) -> str:
     return os.path.join(DATA_DIR, f"seen_trump_{chat_id}.json")
+
+def seen_asia_file(chat_id: str) -> str:
+    return os.path.join(DATA_DIR, f"seen_asia_{chat_id}.json")
 
 # Automatische News: Uhrzeit in Berliner Zeit
 AUTO_HOUR_1   = int(os.environ.get("AUTO_HOUR_1", "7"))   # 07:00 Uhr
@@ -88,6 +93,37 @@ TRUMP_KEYWORDS = [
     "trump", "crypto reserve", "bitcoin reserve", "digital asset",
     "crypto policy", "white house crypto", "strategic reserve",
     "crypto regulation", "sec crypto", "coinbase sec",
+]
+
+# Asien & BRICS Crypto-News
+ASIA_BRICS_FEEDS = [
+    # Asien – Crypto-Medien
+    "https://forkast.news/feed/",              # Hong Kong / Asien Fokus
+    "https://www.theblock.co/rss.xml",          # The Block
+    "https://blockworks.co/feed",               # Blockworks
+    "https://coinpost.jp/?feed=rss2",           # CoinPost Japan
+    # Indien
+    "https://economictimes.indiatimes.com/tech/technology/rssfeeds/13357270.cms",
+    "https://www.livemint.com/rss/markets",     # Mint Indien
+    # China / Hongkong
+    "https://www.scmp.com/rss/91/feed",         # South China Morning Post
+    # Russland / BRICS
+    "https://www.rt.com/rss/business/",         # RT Business
+    # Brasilien
+    "https://www.criptofacil.com/feed/",        # CriptoFacil Brasilien
+    # Sued-Afrika
+    "https://businesstech.co.za/news/feed/",    # BusinessTech SA
+    # Allgemeine Crypto mit Asien-Fokus
+    "https://cointelegraph.com/rss/tag/asia",
+    "https://cointelegraph.com/rss/tag/brics",
+]
+ASIA_BRICS_KEYWORDS = [
+    "xrp", "ripple", "cbdc", "digital yuan", "e-rupee", "e-cny",
+    "brics", "brics currency", "brics digital", "brics crypto",
+    "crypto asia", "blockchain asia", "ripple asia", "xrp asia",
+    "digital rupee", "crypto india", "crypto china", "crypto russia",
+    "crypto brazil", "crypto africa", "ripple partnership",
+    "central bank digital", "cross-border payment",
 ]
 
 # ── Logging (muss vor allen Funktionen stehen die log nutzen) ─────────────────
@@ -362,9 +398,9 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         loop = asyncio.get_running_loop()
 
-        # Beide Kategorien parallel abrufen
+        # Alle Kategorien parallel abrufen
         cid = str(update.effective_chat.id)
-        xrp_entries, trump_entries = await asyncio.gather(
+        xrp_entries, trump_entries, asia_entries = await asyncio.gather(
             asyncio.wait_for(
                 loop.run_in_executor(None, lambda: fetch_news(
                     XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
@@ -379,10 +415,17 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )),
                 timeout=30.0
             ),
+            asyncio.wait_for(
+                loop.run_in_executor(None, lambda: fetch_news(
+                    ASIA_BRICS_FEEDS, ASIA_BRICS_KEYWORDS, NEWS_COUNT,
+                    seen_file=seen_asia_file(cid), mark_seen=True
+                )),
+                timeout=45.0
+            ),
         )
 
-        # Beide formatieren (Uebersetzung)
-        xrp_msg, trump_msg = await asyncio.gather(
+        # Alle formatieren (Uebersetzung)
+        xrp_msg, trump_msg, asia_msg = await asyncio.gather(
             asyncio.wait_for(
                 loop.run_in_executor(None, lambda: format_news_msg(xrp_entries, "XRP & Ripple News")),
                 timeout=30.0
@@ -391,9 +434,13 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 loop.run_in_executor(None, lambda: format_news_msg(trump_entries, "Trump & Crypto Politik")),
                 timeout=30.0
             ),
+            asyncio.wait_for(
+                loop.run_in_executor(None, lambda: format_news_msg(asia_entries, "Asien & BRICS Crypto")),
+                timeout=30.0
+            ),
         )
 
-        for msg in [xrp_msg, trump_msg]:
+        for msg in [xrp_msg, trump_msg, asia_msg]:
             if len(msg) > 4096:
                 msg = msg[:4090] + "..."
             await update.message.reply_text(msg, disable_web_page_preview=True)
@@ -459,11 +506,40 @@ async def cmd_trump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Fehler: {e}")
 
 
+async def cmd_asiabrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Crypto News aus Asien und BRICS-Laendern rund um XRP & Ripple."""
+    await update.message.reply_text("⏳ Hole Asien & BRICS Crypto News...")
+    try:
+        loop = asyncio.get_running_loop()
+        cid  = str(update.effective_chat.id)
+        entries = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: fetch_news(
+                ASIA_BRICS_FEEDS, ASIA_BRICS_KEYWORDS, NEWS_COUNT,
+                seen_file=seen_asia_file(cid), mark_seen=True
+            )),
+            timeout=45.0
+        )
+        msg = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: format_news_msg(
+                entries, "Asien & BRICS Crypto News"
+            )),
+            timeout=30.0
+        )
+        if len(msg) > 4096:
+            msg = msg[:4090] + "..."
+        await update.message.reply_text(msg, disable_web_page_preview=True)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏱ Zeitueberschreitung - bitte spaeter versuchen.")
+    except Exception as e:
+        log.error(f"AsiaBrics-Fehler: {e}")
+        await update.message.reply_text(f"❌ Fehler: {e}")
+
+
 async def cmd_resetnews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Setzt den Gesehen-Status zurueck – alle News erscheinen wieder neu."""
     chat_id = str(update.effective_chat.id)
     deleted = 0
-    for path in [seen_xrp_file(chat_id), seen_trump_file(chat_id)]:
+    for path in [seen_xrp_file(chat_id), seen_trump_file(chat_id), seen_asia_file(chat_id)]:
         if os.path.exists(path):
             os.remove(path)
             deleted += 1
@@ -522,7 +598,7 @@ async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id in users:
         cid = str(chat_id)
         try:
-            xrp_entries, trump_entries = await asyncio.gather(
+            xrp_entries, trump_entries, asia_entries = await asyncio.gather(
                 asyncio.wait_for(
                     loop.run_in_executor(None, lambda c=cid: fetch_news(
                         XRP_FEEDS, XRP_KEYWORDS, NEWS_COUNT,
@@ -537,6 +613,13 @@ async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     )),
                     timeout=30.0
                 ),
+                asyncio.wait_for(
+                    loop.run_in_executor(None, lambda c=cid: fetch_news(
+                        ASIA_BRICS_FEEDS, ASIA_BRICS_KEYWORDS, NEWS_COUNT,
+                        seen_file=seen_asia_file(c), mark_seen=True
+                    )),
+                    timeout=45.0
+                ),
             )
         except asyncio.TimeoutError:
             log.error(f"auto_news_job: Timeout fuer {cid}")
@@ -545,18 +628,22 @@ async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.error(f"auto_news_job: Fetch-Fehler fuer {cid}: {e}")
             continue
 
-        if not xrp_entries and not trump_entries:
+        if not xrp_entries and not trump_entries and not asia_entries:
             log.info(f"auto_news_job: Keine neuen Artikel fuer {cid}")
             continue
 
         try:
-            xrp_msg, trump_msg = await asyncio.gather(
+            xrp_msg, trump_msg, asia_msg = await asyncio.gather(
                 asyncio.wait_for(
                     loop.run_in_executor(None, lambda: format_news_msg(xrp_entries, "XRP & Ripple News")),
                     timeout=30.0
                 ),
                 asyncio.wait_for(
                     loop.run_in_executor(None, lambda: format_news_msg(trump_entries, "Trump & Crypto Politik")),
+                    timeout=30.0
+                ),
+                asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: format_news_msg(asia_entries, "Asien & BRICS Crypto")),
                     timeout=30.0
                 ),
             )
@@ -567,7 +654,7 @@ async def auto_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.error(f"auto_news_job: Format-Fehler fuer {cid}: {e}")
             continue
 
-        for msg in [xrp_msg, trump_msg]:
+        for msg in [xrp_msg, trump_msg, asia_msg]:
             if "Keine aktuellen" in msg:
                 continue
             if len(msg) > 4096:
@@ -595,7 +682,8 @@ def main() -> None:
     app.add_handler(CommandHandler("news",  cmd_news))
     app.add_handler(CommandHandler("xrp",   cmd_xrp))
     app.add_handler(CommandHandler("trump", cmd_trump))
-    app.add_handler(CommandHandler("hilfe",     cmd_hilfe))
+    app.add_handler(CommandHandler("hilfe",      cmd_hilfe))
+    app.add_handler(CommandHandler("asiabrics",  cmd_asiabrics))
     app.add_handler(CommandHandler("resetnews", cmd_resetnews))
 
     # Automatische News 3x taeglich (BERLIN und dtime als Top-Level)
