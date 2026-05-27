@@ -24,6 +24,7 @@ import json
 import logging
 import socket
 import os
+import time as _time
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -105,31 +106,52 @@ log = logging.getLogger(__name__)
 
 
 # ── Gesehene Artikel (verhindert Duplikate) ───────────────────────────────────
+SEEN_MAX_DAYS = int(os.environ.get("SEEN_MAX_DAYS", "7"))  # Artikel nach X Tagen vergessen
+
 def load_seen(path: str) -> set:
-    """Laedt bereits gesehene Artikel-Links aus Datei."""
+    """Laedt gesehene Links. Eintraege aelter als SEEN_MAX_DAYS Tage werden ignoriert."""
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        # Neues Format: {link: timestamp} – altes Format: [link, ...]
+        if isinstance(data, list):
+            return set(data)  # Altes Format ohne Zeitstempel
+        cutoff = _time.time() - SEEN_MAX_DAYS * 86400
+        return {link for link, ts in data.items() if ts > cutoff}
+    except Exception:
+        return set()
+
+def save_seen(path: str, seen_links: set, max_size: int = 500) -> None:
+    """Speichert gesehene Links mit Zeitstempel atomar."""
+    # Bestehendes Dict laden (mit Zeitstempeln)
+    existing = {}
     if os.path.exists(path):
         try:
-            with open(path, "r") as f:
-                return set(json.load(f))
+            with open(path) as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                existing = raw
         except Exception:
             pass
-    return set()
-
-def save_seen(path: str, seen: set, max_size: int = 500) -> None:
-    """Speichert gesehene Links atomar. Behaelt nur die neuesten max_size Eintraege."""
-    lst = sorted(seen)[-max_size:]
+    now = _time.time()
+    for link in seen_links:
+        existing[link] = now
+    # Zu grosse Datei: aelteste Eintraege entfernen
+    if len(existing) > max_size:
+        sorted_items = sorted(existing.items(), key=lambda x: x[1])
+        existing = dict(sorted_items[-max_size:])
     try:
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(lst, f)
+            json.dump(existing, f)
         os.replace(tmp, path)
     except Exception as e:
         log.error(f"Fehler beim Speichern seen: {e}")
 
 
 # ── News-Cache (verhindert zu viele RSS/Translate Anfragen bei vielen Usern) ──
-import time as _time
-
 class NewsCache:
     """Einfacher In-Memory Cache mit TTL fuer RSS-Artikel + Uebersetzungen."""
     def __init__(self, ttl_minutes: int = 30):
@@ -157,11 +179,6 @@ _cache = NewsCache(ttl_minutes=CACHE_TTL_MIN)
 # ── News abrufen ───────────────────────────────────────────────────────────────
 def _fetch_news_raw(feeds: list, keywords: list, count: int = 10) -> list:
     """Interner RSS-Fetch ohne Cache und ohne Seen-Filter."""
-    """
-    Holt News aus RSS-Feeds und filtert nach Keywords.
-    seen_file: Pfad zur Datei mit bereits gesehenen Links (verhindert Duplikate).
-    mark_seen: Wenn True, werden neue Links als gesehen markiert und gespeichert.
-    """
     entries = []
     seen    = set()
 
@@ -178,7 +195,7 @@ def _fetch_news_raw(feeds: list, keywords: list, count: int = 10) -> list:
                 link    = entry.get("link", "")
                 summary = entry.get("summary", entry.get("description", ""))
 
-                if link in seen or link in seen_old or not title:
+                if link in seen or not title:
                     continue
 
                 combined = (title + " " + summary).lower()
@@ -193,21 +210,16 @@ def _fetch_news_raw(feeds: list, keywords: list, count: int = 10) -> list:
                     "published_parsed": entry.get("published_parsed"),
                 })
 
-                if len(entries) >= count * 2:
+                if len(entries) >= count * 4:
                     break
 
         except Exception as e:
             log.error(f"Feed-Fehler {feed_url}: {e}")
 
         # Genug Artikel gesammelt – restliche Feeds ueberspringen
-        if len(entries) >= count * 2:
+        if len(entries) >= count * 4:
             break
 
-    # Neueste zuerst sortieren
-    entries.sort(
-        key=lambda e: e.get("published_parsed") or (0,0,0,0,0,0,0,0,0),
-        reverse=True
-    )
     # Neueste zuerst sortieren
     entries.sort(
         key=lambda e: e.get("published_parsed") or (0,0,0,0,0,0,0,0,0),
@@ -226,7 +238,7 @@ def fetch_news(feeds: list, keywords: list, count: int = 10,
     cache_key   = f"news_{id(feeds)}_{count}"
     all_entries = _cache.get(cache_key)
     if all_entries is None:
-        all_entries = _fetch_news_raw(feeds, keywords, count * 3)
+        all_entries = _fetch_news_raw(feeds, keywords, count * 6)
         _cache.set(cache_key, all_entries)
         log.info(f"Cache MISS: {len(all_entries)} Artikel geladen")
     else:
@@ -338,6 +350,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /news  - Alle News (XRP + Trump Crypto)\n"
         "• /xrp   - Nur XRP & Ripple News\n"
         "• /trump - Nur Trump & Crypto Politik\n"
+        "• /resetnews - Verlauf zuruecksetzen\n"
         "• /hilfe - Befehlsuebersicht",
         parse_mode="Markdown",
     )
@@ -446,6 +459,22 @@ async def cmd_trump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Fehler: {e}")
 
 
+async def cmd_resetnews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Setzt den Gesehen-Status zurueck – alle News erscheinen wieder neu."""
+    chat_id = str(update.effective_chat.id)
+    deleted = 0
+    for path in [seen_xrp_file(chat_id), seen_trump_file(chat_id)]:
+        if os.path.exists(path):
+            os.remove(path)
+            deleted += 1
+    _cache.clear()  # Auch In-Memory Cache leeren
+    await update.message.reply_text(
+        "🔄 Gesehen-Status zurueckgesetzt!\n\n"
+        "Beim naechsten /news oder /xrp erscheinen wieder alle aktuellen Artikel."
+    )
+    log.info(f"Seen-Reset fuer {chat_id}: {deleted} Dateien geloescht")
+
+
 async def cmd_hilfe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📖 *Befehlsuebersicht*\n\n"
@@ -457,7 +486,8 @@ async def cmd_hilfe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/trump - Nur Trump & Crypto Politik\n"
         "        Quellen: CoinTelegraph, Decrypt,\n"
         "        CoinDesk, NY Times, Washington Post\n\n"
-        "/start - Willkommen\n\n"
+        "/start - Willkommen\n"
+        "/resetnews - News-Verlauf zuruecksetzen\n\n"
         "🌍 Alle News automatisch auf Deutsch\n"
         "⏰ Automatisch um 07:00, 13:00 und 23:00 Uhr\n"
         "📍 Zeitzone: Europa/Berlin",
@@ -565,7 +595,8 @@ def main() -> None:
     app.add_handler(CommandHandler("news",  cmd_news))
     app.add_handler(CommandHandler("xrp",   cmd_xrp))
     app.add_handler(CommandHandler("trump", cmd_trump))
-    app.add_handler(CommandHandler("hilfe", cmd_hilfe))
+    app.add_handler(CommandHandler("hilfe",     cmd_hilfe))
+    app.add_handler(CommandHandler("resetnews", cmd_resetnews))
 
     # Automatische News 3x taeglich (BERLIN und dtime als Top-Level)
     app.job_queue.run_daily(
