@@ -58,7 +58,10 @@ def seen_inst_file(chat_id: str) -> str:
 
 # Automatische News: Uhrzeit in Berliner Zeit
 AUTO_HOUR_1   = int(os.environ.get("AUTO_HOUR_1", "7"))   # 07:00 Uhr
-CACHE_TTL_MIN = int(os.environ.get("CACHE_TTL_MIN", "30")) # Cache-Lebenszeit in Minuten
+CACHE_TTL_MIN = int(os.environ.get("CACHE_TTL_MIN", "30"))
+# Admin Chat-ID – in Railway Variables eintragen
+# So ermitteln: /meineid im Bot tippen
+ADMIN_IDS     = set(os.environ.get("ADMIN_IDS", "").split(",")) - {""}  # Komma-getrennte Chat-IDs
 AUTO_HOUR_2   = int(os.environ.get("AUTO_HOUR_2", "13"))  # 13:00 Uhr
 AUTO_HOUR_3   = int(os.environ.get("AUTO_HOUR_3", "23"))  # 23:00 Uhr
 
@@ -620,6 +623,109 @@ async def cmd_institutionen(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(f"❌ Fehler: {e}")
 
 
+def is_admin(update) -> bool:
+    """Prueft ob der User Admin-Rechte hat."""
+    return str(update.effective_chat.id) in ADMIN_IDS
+
+
+async def cmd_meineid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Zeigt die eigene Telegram Chat-ID an (fuer Admin-Einrichtung)."""
+    chat_id = update.effective_chat.id
+    name    = update.effective_chat.first_name or "Unbekannt"
+    await update.message.reply_text(
+        f"👤 Deine Chat-ID:\n\n"
+        f"`{chat_id}`\n\n"
+        f"Name: {name}\n\n"
+        f"Trage diese ID in Railway ein:\n"
+        f"Variable: ADMIN_IDS\n"
+        f"Wert: {chat_id}",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: Sendet eine Nachricht an alle User des Bots."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ Keine Admin-Rechte.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📢 *Admin Broadcast*\n\n"
+            "Verwendung:\n"
+            "`/broadcast Deine Nachricht hier`\n\n"
+            "Beispiel:\n"
+            "`/broadcast XRP gerade sehr bullish! Kurs bei 2.50 EUR`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Nachricht zusammensetzen
+    text = " ".join(context.args)
+    msg  = (
+        f"📢 *Admin-Nachricht*\n\n"
+        f"{escape_md(text)}\n\n"
+        f"🕐 {datetime.now(BERLIN).strftime('%d.%m.%Y %H:%M')} Uhr"
+    )
+
+    # Alle User laden
+    users_file = os.path.join(DATA_DIR, "users.json")
+    if not os.path.exists(users_file):
+        await update.message.reply_text("❌ Keine User registriert.")
+        return
+    try:
+        with open(users_file) as f:
+            users = json.load(f)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fehler: {e}")
+        return
+
+    # An alle senden
+    success = 0
+    failed  = 0
+    for chat_id in users:
+        try:
+            await context.bot.send_message(
+                chat_id=int(chat_id),
+                text=msg,
+                parse_mode="Markdown"
+            )
+            success += 1
+        except Exception as e:
+            log.error(f"Broadcast Fehler {chat_id}: {e}")
+            failed += 1
+
+    await update.message.reply_text(
+        f"✅ Broadcast gesendet!\n\n"
+        f"Erfolgreich: {success} User\n"
+        f"Fehlgeschlagen: {failed} User"
+    )
+    log.info(f"Broadcast von Admin: {success} gesendet, {failed} fehlgeschlagen")
+
+
+async def cmd_userliste(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: Zeigt Anzahl registrierter User."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ Keine Admin-Rechte.")
+        return
+    users_file = os.path.join(DATA_DIR, "users.json")
+    if not os.path.exists(users_file):
+        await update.message.reply_text("📋 Noch keine User registriert.")
+        return
+    try:
+        with open(users_file) as f:
+            users = json.load(f)
+        await update.message.reply_text(
+            f"👥 *Registrierte User*\n\n"
+            f"Gesamt: *{len(users)}* User\n\n"
+            f"Alle haben /start getippt und\n"
+            f"erhalten automatische News.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fehler: {e}")
+
+
 async def cmd_resetnews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Setzt den Gesehen-Status zurueck – alle News erscheinen wieder neu."""
     chat_id = str(update.effective_chat.id)
@@ -639,16 +745,17 @@ async def cmd_resetnews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def cmd_hilfe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📖 *Befehlsuebersicht*\n\n"
-        "/news  - Alle News auf einmal\n"
-        "        XRP + Ripple + Trump Crypto\n\n"
-        "/xrp   - Nur XRP & Ripple News\n"
-        "        Quellen: CoinTelegraph, CryptoNews,\n"
-        "        NewsBTC, NY Times, Washington Post\n\n"
-        "/trump - Nur Trump & Crypto Politik\n"
-        "        Quellen: CoinTelegraph, Decrypt,\n"
-        "        CoinDesk, NY Times, Washington Post\n\n"
-        "/start - Willkommen\n"
-        "/resetnews - News-Verlauf zuruecksetzen\n\n"
+        "📰 *News-Befehle:*\n"
+        "/news          - Alle 4 Kategorien auf einmal\n"
+        "/xrp           - XRP & Ripple News\n"
+        "/trump         - Trump & Crypto Politik\n"
+        "/asiabrics     - Asien & BRICS Crypto\n"
+        "/institutionen - Elon Musk, BlackRock & Co\n"
+        "/resetnews     - Gesehen-Verlauf zuruecksetzen\n\n"
+        "👑 *Admin-Befehle:*\n"
+        "/broadcast Text - Nachricht an alle User\n"
+        "/userliste      - Anzahl User anzeigen\n"
+        "/meineid        - Eigene Chat-ID anzeigen\n\n"
         "🌍 Alle News automatisch auf Deutsch\n"
         "⏰ Automatisch um 07:00, 13:00 und 23:00 Uhr\n"
         "📍 Zeitzone: Europa/Berlin",
@@ -781,7 +888,10 @@ def main() -> None:
     app.add_handler(CommandHandler("hilfe",      cmd_hilfe))
     app.add_handler(CommandHandler("asiabrics",      cmd_asiabrics))
     app.add_handler(CommandHandler("institutionen",  cmd_institutionen))
-    app.add_handler(CommandHandler("resetnews", cmd_resetnews))
+    app.add_handler(CommandHandler("resetnews",   cmd_resetnews))
+    app.add_handler(CommandHandler("meineid",     cmd_meineid))
+    app.add_handler(CommandHandler("broadcast",   cmd_broadcast))
+    app.add_handler(CommandHandler("userliste",   cmd_userliste))
 
     # Automatische News 3x taeglich (BERLIN und dtime als Top-Level)
     app.job_queue.run_daily(
